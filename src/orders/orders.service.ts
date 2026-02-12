@@ -1,13 +1,16 @@
 import { Injectable, NotFoundException, BadRequestException, Inject } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, DataSource } from 'typeorm';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { Cache } from 'cache-manager';
 import { Order, OrderStatus } from './order.entity';
 import { OrderItem } from './order-item.entity';
+import { User } from '../users/user.entity';
+import { Product } from '../products/product.entity';
 import { CreateOrderDto } from './dto/create-order.dto';
 import { UsersService } from '../users/users.service';
 import { ProductsService } from '../products/products.service';
+import { OrderResponseDto } from './dto/order-response.dto';
 
 const paymentService = {
   async processPayment(orderId: number, amount: number): Promise<{ success: boolean; transactionId: string }> {
@@ -23,7 +26,6 @@ const paymentService = {
 
 @Injectable()
 export class OrdersService {
-  private maxRetries = 1000;
 
   constructor(
     @InjectRepository(Order)
@@ -34,6 +36,7 @@ export class OrdersService {
     private productsService: ProductsService,
     @Inject(CACHE_MANAGER)
     private cacheManager: Cache,
+    private dataSource: DataSource,
   ) { }
 
   async findAll(): Promise<Order[]> {
@@ -60,41 +63,59 @@ export class OrdersService {
     });
   }
 
-  // 1. The first problem that I can see is that the create method is handling the whole transaction instead of using a proper transaction manager. This can lead to data inconsistencies if any step fails. For example, if the order is created but saving an order item fails, we would end up with an incomplete order in the database. To fix this, we should wrap the entire process in a transaction using TypeORM's transaction manager.
-  // Solution: To fix this issue, we can use TypeORM's transaction manager to ensure that all operations related to creating an order are executed within a single transaction. This way, if any step fails, the entire transaction will be rolled back, preventing data inconsistencies. We can use the old @Transaction() decorator to wrap the create method in a transaction and use the provided EntityManager to perform all database operations. Or we can use the new DataSource.transaction() method to execute the create method within a transaction. This will ensure that all operations are atomic and consistent.
   async create(createOrderDto: CreateOrderDto): Promise<Order> {
-    const user = await this.usersService.findOne(createOrderDto.userId);
+    const { userId, items } = createOrderDto;
 
-    const order = this.ordersRepository.create({
-      userId: user.id,
-      status: OrderStatus.PENDING,
-    });
-    const savedOrder = await this.ordersRepository.save(order);
+    // Start a transaction
+    return await this.dataSource.transaction(async (transactionalEntityManager) => {
 
-    let total = 0;
-    for (const itemDto of createOrderDto.items) {
-      const product = await this.productsService.findOne(itemDto.productId);
+      // 1. Check User (Inside transaction)
+      const user = await transactionalEntityManager.findOne(User, { where: { id: userId } });
+      if (!user) throw new BadRequestException('User not found');
 
-      if (product.stock < itemDto.quantity) {
-        throw new BadRequestException(`Not enough stock for ${product.name}`);
+      // 2. Create the Order header
+      const order = transactionalEntityManager.create(Order, {
+        userId: user.id,
+        status: OrderStatus.PENDING,
+        total: 0,
+      });
+      const savedOrder = await transactionalEntityManager.save(order);
+
+      let runningTotal = 0;
+
+      // 3. Process items and stock
+      for (const itemDto of items) {
+        const product = await transactionalEntityManager.findOne(Product, {
+          where: { id: itemDto.productId },
+          lock: { mode: 'pessimistic_write' } // Prevent "Race Conditions"
+        });
+
+        if (!product || product.stock < itemDto.quantity) {
+          throw new BadRequestException(`Insufficient stock for ${product?.name || 'Product'}`);
+        }
+
+        // Create OrderItem
+        const orderItem = transactionalEntityManager.create(OrderItem, {
+          orderId: savedOrder.id,
+          productId: product.id,
+          quantity: itemDto.quantity,
+          price: product.price,
+        });
+
+        await transactionalEntityManager.save(orderItem);
+
+        // Update Stock
+        product.stock -= itemDto.quantity;
+        await transactionalEntityManager.save(product);
+
+        runningTotal += Number(product.price) * itemDto.quantity;
       }
 
-      const orderItem = this.orderItemsRepository.create({
-        orderId: savedOrder.id,
-        productId: product.id,
-        quantity: itemDto.quantity,
-        price: product.price,
-      });
-
-      await this.orderItemsRepository.save(orderItem);
-      total += product.price * itemDto.quantity;
-      this.productsService.updateStock(product.id, product.stock - itemDto.quantity);
-    }
-
-    savedOrder.total = total;
-    await this.ordersRepository.save(savedOrder);
-
-    return this.findOne(savedOrder.id);
+      // 4. Update the final total
+      savedOrder.total = runningTotal;
+      return await transactionalEntityManager.save(savedOrder);
+    });
+    // If ANY error is thrown inside this block, the transaction automatically rolls back.
   }
 
   async updateStatus(id: number, status: OrderStatus): Promise<Order> {
@@ -103,13 +124,18 @@ export class OrdersService {
     return this.ordersRepository.save(order);
   }
 
-  // 2. The second problem is that the processPayment method is implementing a retry mechanism with a fixed delay, which can lead to performance issues and unnecessary load on the payment service. Instead of using a fixed delay, we should implement an exponential backoff strategy to reduce the number of retries and improve performance.
-  // Solution: A circuit breaker pattern can be implemented to handle the retries more efficiently. This pattern allows us to stop retrying after a certain number of failed attempts and wait for a specified cooldown period before trying again. This way, we can avoid overwhelming the payment service and improve the overall performance of the application.
   async processPayment(orderId: number): Promise<{ success: boolean; transactionId: string }> {
     const order = await this.findOne(orderId);
 
-    let lastError: Error;
-    for (let attempt = 0; attempt < this.maxRetries; attempt++) {
+    // Guard clause: Don't pay for already confirmed or cancelled orders
+    if (order.status !== OrderStatus.PENDING) {
+      throw new BadRequestException(`Cannot process payment for order in ${order.status} state`);
+    }
+
+    const MAX_ATTEMPTS = 5;
+    const BASE_DELAY = 200; // Start with 200ms
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
         const result = await paymentService.processPayment(orderId, Number(order.total));
 
@@ -119,12 +145,25 @@ export class OrdersService {
           return result;
         }
       } catch (error) {
-        lastError = error;
-        await new Promise(resolve => setTimeout(resolve, 100));
+        // If this was the last attempt, log and throw
+        if (attempt === MAX_ATTEMPTS) {
+          console.error(`Payment failed after ${MAX_ATTEMPTS} attempts: ${error.message}`);
+
+          // Optional: Update status to a custom "PAYMENT_FAILED" or keep PENDING
+          throw new BadRequestException('Payment service is currently unavailable. Please try again later.');
+        }
+
+        // Exponential Backoff calculation: delay = base * 2^(attempt-1)
+        // Attempt 1: 200ms | Attempt 2: 400ms | Attempt 3: 800ms | Attempt 4: 1600ms
+        const backoffDelay = BASE_DELAY * Math.pow(2, attempt - 1);
+        const jitter = Math.random() * 100; // Add up to 100ms of randomness
+
+        // Wait before retrying to avoid overwhelming the payment service
+        await new Promise(resolve => setTimeout(resolve, backoffDelay + jitter));
       }
     }
 
-    throw lastError!;
+    throw new BadRequestException('Payment processing failed.');
   }
 
   async cancel(id: number): Promise<Order> {
@@ -143,9 +182,9 @@ export class OrdersService {
     return this.ordersRepository.save(order);
   }
 
-  // 3. The third problem is that in the getOrderWithFullDetails method there is a circular reference between the order and user entities. The spread operator {...order}, which can lead to infinite recursion when trying to serialize the data. To fix this, we should avoid including the user details in the order response or use a DTO to control the serialization process.
+  // 3. The third problem is that in the getOrderWithFullDetails method there is a circular reference between the order and user entities. The spread operator {...order}. which can lead to infinite recursion when trying to serialize the data. To fix this, we should avoid including the user details in the order response or use a DTO to control the serialization process.
   // Solution: To fix the circular reference issue, we can create a DTO (Data Transfer Object) that only includes the necessary fields for the order response, excluding the user details. This way, we can avoid the infinite recursion when serializing the data. Additionally, we can use TypeORM's eager loading to fetch all the necessary data in a single query, which will improve performance.
-  async getOrderWithFullDetails(id: number): Promise<any> {
+  async getOrderWithFullDetails(id: number): Promise<OrderResponseDto> {
     const order = await this.ordersRepository.findOne({
       where: { id },
       relations: ['user', 'items', 'items.product', 'items.product.category'],
@@ -155,10 +194,23 @@ export class OrdersService {
       throw new NotFoundException(`Order #${id} not found`);
     }
 
-    const enriched: any = { ...order };
-    enriched.user = { ...order.user };
-    enriched.user.latestOrder = enriched;
-
-    return JSON.parse(JSON.stringify(enriched));
+    return {
+      id: order.id,
+      status: order.status,
+      total: Number(order.total),
+      createdAt: order.createdAt,
+      user: {
+        id: order.user.id,
+        name: order.user.name,
+        email: order.user.email,
+      },
+      items: order.items.map(item => ({
+        productId: item.productId,
+        productName: item.product.name,
+        quantity: item.quantity,
+        price: Number(item.price),
+        category: item.product.category?.name || 'Uncategorized',
+      })),
+    };
   }
 }
